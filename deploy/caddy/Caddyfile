@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Caddy: el unico servicio con puertos publicados en produccion.
+# ---------------------------------------------------------------------------
+#
+# QUE HACE
+# --------
+#  1. Termina HTTPS con un certificado de una autoridad gratuita.
+#  2. Sirve la interfaz (Nuxt) en la raiz.
+#  3. Reenvia `/api/*` a la API de Laravel.
+#  4. Reenvia `/auth/*` a la API: el login vive ahi.
+#
+# LO QUE NO HACE, A PROPOSITO
+# ----------------------------
+# No sirve archivos estaticos de la API: Laravel tiene su propio servidor para
+# eso. Y no registra cuerpos de peticion, que pueden traer datos personales de
+# un pasajero.
+#
+# `Strict-Transport-Security` con `preload`: el navegador obliga a seguir por
+# HTTPS despues de la primera visita. Sin esto, el primer ingreso podria ir
+# en claro y la cookie de sesion viaja en esa peticion.
+
+{$AGENCIA_DOMINIO} {
+	encode zstd gzip
+
+	# HSTS: el navegador obliga a HTTPS desde la primera visita.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		# La interfaz no carga recursos de terceros. Decirlo es mas fuerte que
+		# permitir y confiar: si alguien mete un script externo, el navegador lo
+		# bloquea.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'"
+		# La API es de otro origen interno. No se expone.
+		-Server
+	}
+
+	# El login y la API.
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+
+	handle /auth/* {
+		reverse_proxy api:8080
+	}
+
+	# Todo lo demas es la interfaz, que hace el renderizado en el servidor.
+	handle {
+		reverse_proxy web:3000
+	}
+
+	log {
+		# Registro de acceso. NO el cuerpo de la peticion: puede contener
+		# datos personales de un pasajero, y un log de acceso con el cuerpo es
+		# un segundo lugar donde vive el dato, sin los controles del primero.
+		output file /data/acceso.log {
+			roll_size 20mb
+			roll_keep 10
+		}
+	}
+}

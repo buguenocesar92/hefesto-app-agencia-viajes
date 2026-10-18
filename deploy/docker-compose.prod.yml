@@ -1,0 +1,270 @@
+# ---------------------------------------------------------------------------
+# Agencia de Viajes: entorno de PRODUCCION
+# ---------------------------------------------------------------------------
+#
+# Uso:
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d
+#
+# QUE HACE DIFERENTE A DESARROLLO
+# -------------------------------
+#  - NO publica puertos de la API, de la web ni de Authentik. Solo Caddy esta
+#    expuesto, y solo por 80 y 443. Los puertos de PostgreSQL y Redis tampoco:
+#    quedan dentro de la red de Docker, sin forma de llegar desde Internet.
+#  - El codigo va DENTRO de la imagen. En desarrollo es un volumen montado.
+#  - Usa imagenes ya construidas, no `build`: el despliegue tiene que ser
+#    reproducible y no depender de que el codigo fuente este en el servidor.
+#  - Redis exige contrasena.
+#  - El contenedor corre sin permisos de root.
+#
+# LO QUE SE REVISA ANTES DE LEVANTAR
+# ----------------------------------
+#   1. Que el rol de la base NO sea superusuario ni tenga BYPASSRLS.
+#   2. Que las tablas tengan RLS activada y forzada.
+#   3. Que el indice de exclusion de asientos exista.
+#
+# Para eso esta `viajes:verificar-aislamiento`. Ver docs/08.
+# ---------------------------------------------------------------------------
+
+name: agencia-viajes
+
+services:
+  # -------------------------------------------------------------------------
+  # PostgreSQL.
+  #
+  # El puerto NO se publica: la base no es alcanzable desde Internet. La API
+  # entra por el nombre del servicio dentro de la red de Docker.
+  # -------------------------------------------------------------------------
+  # DOS ROLES, Y NO UNO
+  # -------------------
+  # `POSTGRES_USER` es el rol de ARRANQUE: la imagen oficial ejecuta
+  # `initdb --username="$POSTGRES_USER"` y ese rol nace superusuario. Solo
+  # se usa para crear la base y para las tareas administrativas. La
+  # aplicacion NUNCA conecta con el.
+  #
+  # El rol de la aplicacion (`DB_USERNAME`) lo crea
+  # `deploy/postgres/inicializar-rol.sh` al inicializar el volumen, con
+  # NOSUPERUSER y NOBYPASSRLS explicitos. Le da la propiedad de la base
+  # para que las migraciones de Laravel puedan crear el esquema.
+  #
+  # POR QUE IMPORTA: la documentacion de PostgreSQL 18 dice que los
+  # superusuarios "always bypass the row security system", y que
+  # `FORCE ROW LEVEL SECURITY` sujeta solo al DUENO de la tabla, no al
+  # superusuario. Con un solo rol las politicas no se aplicarian y el
+  # aislamiento entre empresas seria decorativo. Ver docs/03.
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:?falta DB_DATABASE en el .env.prod}
+      POSTGRES_USER: ${DB_ADMIN_USERNAME:-agencia_viajes_admin}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?falta DB_ADMIN_PASSWORD en el .env.prod}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      # Rol con el que conecta la aplicacion. Lo crea el script de arranque.
+      APP_DB_ROLE: ${DB_USERNAME:-agencia_app}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en el .env.prod}
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./postgres/inicializar-rol.sh:/docker-entrypoint-initdb.d/inicializar-rol.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-agencia_app} -d ${DB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - interna
+
+  # -------------------------------------------------------------------------
+  # Redis.
+  #
+  # Con contrasena en produccion. Guarda el candado de contencion de asientos
+  # (que es una optimizacion, no la garantia) y la cache.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:8.8.3-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?falta REDIS_PASSWORD en el .env.prod}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - redis-datos:/data
+    networks:
+      - interna
+
+  # -------------------------------------------------------------------------
+  # API (Laravel).
+  # -------------------------------------------------------------------------
+  api:
+    image: ${API_IMAGE:?falta API_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      APP_NAME: "Agencia de Viajes"
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY:?falta APP_KEY en el .env.prod}
+      APP_URL: ${APP_URL:?falta APP_URL en el .env.prod}
+      LOG_CHANNEL: stack
+      LOG_LEVEL: warning
+
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SSLMODE: require
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: database
+      SESSION_SECURE_COOKIE: "true"
+
+      ASIENTOS_CANDADO_TTL: "15"
+
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER}
+      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID}
+      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET}
+      AUTHENTIK_REDIRECT_URI: ${AUTHENTIK_REDIRECT_URI}
+      AUTHENTIK_SCOPES: ${AUTHENTIK_SCOPES:-openid profile email}
+      AUTHENTIK_GRUPO_ADMIN: ${AUTHENTIK_GRUPO_ADMIN:-agencia-administradores}
+
+      # Retencion de la bitacora de accesos a datos personales. Ley 19.628.
+      BITACORA_RETENCION_DIAS: ${BITACORA_RETENCION_DIAS:-1825}
+
+      AGENCIA_CORRER_MIGRACIONES: "true"
+    networks:
+      - interna
+      - publica
+
+  # -------------------------------------------------------------------------
+  # Interfaz (Nuxt).
+  # -------------------------------------------------------------------------
+  web:
+    image: ${WEB_IMAGE:?falta WEB_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NUXT_API_BASE: http://api:8080
+      NUXT_PUBLIC_BASE: ${APP_WEB_URL:?falta APP_WEB_URL en el .env.prod}
+    networks:
+      - interna
+      - publica
+
+  # -------------------------------------------------------------------------
+  # Caddy: el unico servicio con puertos publicados.
+  #
+  # Termina TLS, sirve la web y reenvia /api a la API. Ver caddy/Caddyfile.
+  # -------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?falta ACME_EMAIL en el .env.prod}
+      AGENCIA_DOMINIO: ${AGENCIA_DOMINIO:?falta AGENCIA_DOMINIO en el .env.prod}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-datos:/data
+      - caddy-configuracion:/config
+    networks:
+      - publica
+
+  # -------------------------------------------------------------------------
+  # Authentik: su propia base de datos, separada de la de la agencia.
+  # -------------------------------------------------------------------------
+  authentik-postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:?falta AUTHENTIK_POSTGRESQL__PASSWORD en el .env.prod}
+    volumes:
+      - authentik-postgres-datos:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRESQL__USER:-authentik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - interna
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: server
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?falta AUTHENTIK_SECRET_KEY en el .env.prod}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    networks:
+      - interna
+      - publica
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN}
+    volumes:
+      - authentik-media:/media
+    networks:
+      - interna
+
+networks:
+  # Red sin salida a Internet: PostgreSQL, Redis y Authentik viven aca. Un
+  # contenedor que se agrega a esta red no puede alcanzar Internet.
+  interna:
+    internal: true
+
+  # Red de cara a Caddy.
+  publica:
+
+volumes:
+  postgres-datos:
+  redis-datos:
+  authentik-postgres-datos:
+  authentik-media:
+  caddy-datos:
+  caddy-configuracion:

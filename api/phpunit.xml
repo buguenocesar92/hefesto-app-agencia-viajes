@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Configuracion de pruebas de la API de la agencia.
+
+    IMPORTANTE: las pruebas corren contra PostgreSQL de verdad, nunca contra
+    SQLite. El aislamiento entre agencias esta implementado con Row Level
+    Security, y RLS es una funcion de PostgreSQL: contra SQLite, las pruebas
+    de aislamiento pasarian sin comprobar nada. Ver docs/10.
+
+    Las pruebas de concurrencia de asientos (suite Asientos) necesitan la
+    extension btree_gist, que se instala en la migracion de asientos.
+-->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         cacheDirectory=".phpunit.cache"
+         failOnWarning="true"
+         failOnRisky="true">
+    <testsuites>
+        <testsuite name="Aislamiento">
+            <directory>tests/Feature/Aislamiento</directory>
+        </testsuite>
+        <testsuite name="Asientos">
+            <directory>tests/Feature/Asientos</directory>
+        </testsuite>
+        <testsuite name="Boleto">
+            <directory>tests/Feature/Boleto</directory>
+        </testsuite>
+        <testsuite name="Pagos">
+            <directory>tests/Feature/Pagos</directory>
+        </testsuite>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="APP_KEY" value="base64:VGVzdGluZ1ZhbHVlRXhpdGVuZElzTm90UmVhbCtUaGVyZUFwcGxpY2F0aW9uS2V5MzI="/>
+        <env name="APP_DEBUG" value="true"/>
+        <env name="APP_URL" value="http://localhost:8000"/>
+        <env name="DB_CONNECTION" value="pgsql"/>
+        <env name="DB_HOST" value="127.0.0.1"/>
+        <env name="DB_PORT" value="5432"/>
+        <env name="DB_DATABASE" value="agencia_viajes_test"/>
+        <env name="DB_USERNAME" value="agencia_app"/>
+        <env name="DB_PASSWORD" value=""/>
+        <env name="CACHE_STORE" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+    </php>
+</phpunit>
